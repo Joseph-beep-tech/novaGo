@@ -1,0 +1,173 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Restaurant {
+  id                     String     @id
+  name                   String
+  description            String?
+  cuisine                String
+  rating                 Float      @default(0)
+  reviewCount            Int        @default(0)
+  deliveryFee            Float
+  deliveryTimeMinutesMin Int
+  deliveryTimeMinutesMax Int
+  currencyCode           String?    @default("KES")
+  currencySymbol         String?    @default("KSh")
+  address                String
+  imageUrl               String
+  phone                  String?
+  hours                  String?
+  minOrder               Float?
+  features               String[]   @default([])
+  isOpen                 Boolean    @default(true)
+  isPromoted             Boolean    @default(false)
+  discount               String?
+
+  menuItems              MenuItem[]
+  orders                 Order[]
+  payments               Payment[]
+}
+
+model MenuItem {
+  id              String    @id
+  restaurantId    String
+  restaurant      Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  name            String
+  description     String?
+  price           Float
+  imageUrl        String
+  category        String
+  isAvailable     Boolean   @default(true)
+  isVegetarian    Boolean?
+  rating          Float?
+  prepTimeMinutes Int?
+
+  orderItems      OrderItem[]
+}
+
+model Order {
+  id                String        @id
+  restaurantId      String
+  restaurant        Restaurant    @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  subtotal          Float
+  deliveryFee       Float
+  tax               Float
+  total             Float
+  status            OrderStatus
+  customerName      String
+  customerPhone     String?
+  deliveryAddress   String
+  driverId          String?
+  etaMinutes        Int?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  items             OrderItem[]
+  statusHistory     TrackingStep[]
+  payment           Payment?
+}
+
+model OrderItem {
+  id         String   @id @default(cuid())
+  orderId    String
+  order      Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItemId String
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id])
+  name       String
+  price      Float
+  quantity   Int
+}
+
+model TrackingStep {
+  id        String      @id
+  orderId   String
+  order     Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    OrderStatus
+  message   String
+  timestamp DateTime
+}
+
+model Payment {
+  id            String         @id
+  orderId       String         @unique
+  order         Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  amount        Float
+  method        PaymentMethod
+  status        PaymentStatus
+  transactionId String?
+  paidAt        DateTime?
+  createdAt     DateTime       @default(now())
+  customerName  String
+  restaurantId  String
+  restaurant    Restaurant     @relation(fields: [restaurantId], references: [id])
+}
+
+model Rider {
+  id               String       @id
+  name             String
+  email            String
+  phone            String
+  vehicle          String
+  vehicleNumber    String
+  status           RiderStatus
+  currentLat       Float?
+  currentLng       Float?
+  currentOrderId   String?
+  rating           Float
+  totalDeliveries  Int
+  isActive         Boolean      @default(true)
+  createdAt        DateTime     @default(now())
+}
+
+model User {
+  id           String   @id
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         UserRole
+}
+
+enum OrderStatus {
+  pending
+  confirmed
+  preparing
+  ready
+  assigned
+  picked_up
+  on_the_way
+  delivered
+  cancelled
+}
+
+enum PaymentStatus {
+  pending
+  completed
+  failed
+  refunded
+}
+
+enum PaymentMethod {
+  card
+  cash
+  wallet
+  online
+}
+
+enum RiderStatus {
+  available
+  busy
+  offline
+}
+
+enum UserRole {
+  customer
+  restaurant
+  admin
+}
+

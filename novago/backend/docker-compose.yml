@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: novago-backend
+    ports:
+      - "${PORT:-4000}:4000"
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - JWT_SECRET=${JWT_SECRET:-change-this-secret-in-production}
+      - DATABASE_URL=postgresql://novago:novago@db:5432/novago?schema=public    
+    volumes:
+      # Mount uploads directory to persist uploaded files
+      - ./uploads:/app/uploads
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - novago-network
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    container_name: novago-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=novago
+      - POSTGRES_PASSWORD=novago
+      - POSTGRES_DB=novago
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - novago-network
+
+networks:
+  novago-network:
+    driver: bridge
+
+volumes:
+  pgdata:
