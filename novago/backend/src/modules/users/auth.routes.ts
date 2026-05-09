@@ -134,4 +134,70 @@ authRouter.get('/me', (req, res) => {
   }
 });
 
+// Seed demo users (development only)
+authRouter.post('/init', async (req, res) => {
+  try {
+    const demoUsers = [
+      {
+        email: 'admin@novago.com',
+        name: 'Admin User',
+        password: 'admin123',
+        role: 'admin' as const,
+      },
+      {
+        email: 'restaurant@novago.com',
+        name: 'Restaurant Owner',
+        password: 'restaurant123',
+        role: 'restaurant' as const,
+      },
+      {
+        email: 'customer@novago.com',
+        name: 'Test Customer',
+        password: 'customer123',
+        role: 'customer' as const,
+      },
+    ];
+
+    const results = [];
+    for (const user of demoUsers) {
+      // Check if user exists
+      const existingUser = await prisma.user.findUnique({ where: { email: user.email } });
+      if (existingUser) {
+        results.push({ email: user.email, status: 'already_exists' });
+        continue;
+      }
+
+      const passwordHash = hashPassword(user.password);
+      const createdUser = await prisma.user.create({
+        data: {
+          id: `user-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 9)}`,
+          email: user.email,
+          name: user.name,
+          passwordHash,
+          role: user.role,
+        },
+      });
+
+      results.push({
+        email: createdUser.email,
+        status: 'created',
+        credentials: { email: user.email, password: user.password },
+      });
+    }
+
+    res.json({
+      message: 'Demo users initialized',
+      results,
+      credentials: {
+        admin: { email: 'admin@novago.com', password: 'admin123' },
+        restaurant: { email: 'restaurant@novago.com', password: 'restaurant123' },
+        customer: { email: 'customer@novago.com', password: 'customer123' },
+      },
+    });
+  } catch (err) {
+    console.error('Error initializing demo users:', err);
+    res.status(500).json({ message: 'Failed to initialize demo users', error: err });
+  }
+});
+
 

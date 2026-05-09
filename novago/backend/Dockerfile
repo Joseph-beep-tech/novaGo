@@ -10,6 +10,12 @@ COPY tsconfig.json ./
 # Install dependencies
 RUN npm ci
 
+# Copy Prisma schema
+COPY prisma ./prisma
+
+# Generate Prisma client
+RUN npx prisma generate
+
 # Copy source code
 COPY src ./src
 
@@ -29,6 +35,12 @@ RUN npm ci --only=production && npm cache clean --force
 
 # Copy built files from builder
 COPY --from=builder /app/dist ./dist
+
+# Copy Prisma files from builder
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+
+# Copy Prisma schema
+COPY prisma ./prisma
 
 # Create uploads directory with proper permissions
 RUN mkdir -p uploads/restaurants uploads/menus && \
