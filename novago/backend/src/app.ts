@@ -10,6 +10,7 @@ import { orderRouter } from './modules/orders/order.routes';
 import { authRouter } from './modules/users/auth.routes';
 import { paymentRouter } from './modules/payments/payment.routes';
 import { riderRouter } from './modules/riders/rider.routes';
+import { whatsappRouter } from './modules/whatsapp/whatsapp.routes';
 
 export function createApp() {
   const app = express();
@@ -20,8 +21,6 @@ export function createApp() {
   app.use(express.urlencoded({ extended: true }));
   app.use(morgan('dev'));
 
-  // Serve static files from uploads directory
-  // Handle both compiled (dist) and dev (src) directory structures
   const uploadsPath = path.join(process.cwd(), 'uploads');
   app.use('/uploads', express.static(uploadsPath));
 
@@ -29,19 +28,18 @@ export function createApp() {
     res.json({ status: 'ok', service: 'novago-backend' });
   });
 
-  app.use('/api/auth', authRouter);
+  app.use('/api/auth',        authRouter);
   app.use('/api/restaurants', restaurantRouter);
-  app.use('/api/menus', menuRouter);
-  app.use('/api/orders', orderRouter);
-  app.use('/api/payments', paymentRouter);
-  app.use('/api/riders', riderRouter);
+  app.use('/api/menus',       menuRouter);
+  app.use('/api/orders',      orderRouter);
+  app.use('/api/payments',    paymentRouter);
+  app.use('/api/riders',      riderRouter);
+  app.use('/api/whatsapp',    whatsappRouter);
 
-  // 404 handler
   app.use((_req, res) => {
     res.status(404).json({ message: 'Not found' });
   });
 
-  // Basic error handler
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error(err);
@@ -50,5 +48,3 @@ export function createApp() {
 
   return app;
 }
-
-

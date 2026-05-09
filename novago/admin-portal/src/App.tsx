@@ -14,21 +14,15 @@ import Payments from './pages/Payments';
 import Riders from './pages/Riders';
 import Analytics from './pages/Analytics';
 import Users from './pages/Users';
+import WhatsApp from './pages/WhatsApp';
 import Layout from './components/Layout';
 
 const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      refetchOnWindowFocus: false,
-      retry: 1,
-    },
-  },
+  defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
 });
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
-  if (!authService.isAuthenticated()) {
-    return <Navigate to="/login" replace />;
-  }
+  if (!authService.isAuthenticated()) return <Navigate to="/login" replace />;
   return <>{children}</>;
 }
 
@@ -38,14 +32,7 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
-          <Route
-            path="/"
-            element={
-              <PrivateRoute>
-                <Layout />
-              </PrivateRoute>
-            }
-          >
+          <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
             <Route index element={<Dashboard />} />
             <Route path="restaurants" element={<Restaurants />} />
             <Route path="restaurants/new" element={<CreateRestaurant />} />
@@ -58,6 +45,7 @@ function App() {
             <Route path="riders" element={<Riders />} />
             <Route path="analytics" element={<Analytics />} />
             <Route path="users" element={<Users />} />
+            <Route path="whatsapp" element={<WhatsApp />} />
           </Route>
         </Routes>
       </BrowserRouter>
@@ -66,4 +54,3 @@ function App() {
 }
 
 export default App;
-
