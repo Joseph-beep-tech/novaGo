@@ -1,233 +1,247 @@
-import { Router, Request, Response } from 'express';
-import { prisma } from '../../utils/prisma';
+/**
+ * whatsapp.routes.ts
+ *
+ * Single proxy between NovaGo admin portal and the wa.dt.wrld-main services.
+ * All session + chat + message calls from the frontend go through here,
+ * avoiding CORS and keeping credentials server-side.
+ *
+ * wwebjs-api     (WA_API_URL  default: http://localhost:3000) — QR / session mgmt
+ * whatsapp-service (WA_SVC_URL default: http://localhost:3001) — chats / messages / AI
+ *
+ * Exact wwebjs-api endpoints used:
+ *   GET  /session/start/:id
+ *   GET  /session/status/:id      → returns { success, data: { state, ... } }
+ *   GET  /session/qr/:id/image    → returns PNG image
+ *   GET  /session/getSessions     → returns array of sessions
+ *   GET  /session/terminate/:id
+ *   GET  /session/restart/:id
+ *
+ * whatsapp-service endpoints:
+ *   GET  /session/status/:id      → proxied from wwebjs-api, normalised
+ *   GET  /session/qr/:id/image    → proxied from wwebjs-api
+ *   GET  /chats
+ *   GET  /chats/messages
+ *   POST /chats/send
+ *   POST /chats/claim
+ *   POST /chats/release
+ *   GET  /chats/context
+ */
 
+import { Router, Request, Response } from 'express';
+import { PrismaClient } from '@prisma/client';
+
+const prisma = new PrismaClient();
 export const whatsappRouter = Router();
 
-const WA_API_URL = process.env.WA_API_URL || 'http://localhost:3000';
-const WA_SVC_URL = process.env.WA_SVC_URL || 'http://localhost:3001';
-const WA_API_KEY = process.env.WA_API_KEY || '';
+const WA_API_URL = process.env.WA_API_URL  || 'http://localhost:3000';   // wwebjs-api
+const WA_SVC_URL = process.env.WA_SVC_URL  || 'http://localhost:3001';   // whatsapp-service
+const WA_API_KEY = process.env.WA_API_KEY  || '';
 
-const waHeaders = () => ({
-  'x-api-key': WA_API_KEY,
-  'Content-Type': 'application/json',
-});
+// ── Shared headers ────────────────────────────────────────────────────────────
 
-// Helper to fetch with timeout
-async function fetchWithTimeout(url: string, opts: RequestInit = {}, timeoutMs = 5000) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: controller.signal });
-  } finally {
-    clearTimeout(timeout);
-  }
+function waHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    ...(WA_API_KEY ? { 'x-api-key': WA_API_KEY } : {}),
+  };
 }
 
-async function waApi(path: string, opts: RequestInit = {}) {
+// ── Generic JSON proxy helpers ────────────────────────────────────────────────
+
+async function proxyJson(
+  res: Response,
+  url: string,
+  opts: RequestInit = {}
+): Promise<void> {
   try {
-    const res = await fetchWithTimeout(`${WA_API_URL}${path}`, {
+    const upstream = await fetch(url, {
       ...opts,
       headers: { ...waHeaders(), ...(opts.headers as Record<string, string> || {}) },
     });
-    const body = await res.json().catch(() => ({}));
-    return { status: res.status, body };
-  } catch (err) {
-    console.error(`[WhatsApp API] Error calling ${WA_API_URL}${path}:`, err);
-    return { status: 503, body: { error: 'WhatsApp API service unavailable', service: 'wwebjs-api', url: WA_API_URL } };
+    const body = await upstream.json().catch(() => ({}));
+    res.status(upstream.status).json(body);
+  } catch (err: any) {
+    res.status(503).json({ success: false, error: `Service unavailable: ${err.message}` });
   }
 }
 
-async function waSvc(path: string, opts: RequestInit = {}) {
+async function proxyImage(res: Response, url: string): Promise<void> {
   try {
-    const res = await fetchWithTimeout(`${WA_SVC_URL}${path}`, {
-      ...opts,
-      headers: { ...waHeaders(), ...(opts.headers as Record<string, string> || {}) },
-    });
-    const body = await res.json().catch(() => ({}));
-    return { status: res.status, body };
-  } catch (err) {
-    console.error(`[WhatsApp Service] Error calling ${WA_SVC_URL}${path}:`, err);
-    return { status: 503, body: { error: 'WhatsApp service unavailable', service: 'whatsapp-service', url: WA_SVC_URL } };
+    const upstream = await fetch(url, { headers: waHeaders() });
+    if (!upstream.ok) {
+      res.status(upstream.status).json({ success: false, error: 'QR not available yet' });
+      return;
+    }
+    const contentType = upstream.headers.get('content-type') || 'image/png';
+    const buf = await upstream.arrayBuffer();
+    res.setHeader('Content-Type', contentType);
+    res.send(Buffer.from(buf));
+  } catch (err: any) {
+    res.status(503).json({ success: false, error: `Service unavailable: ${err.message}` });
   }
 }
 
-// ── Session management (admin portal QR connect) ──────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// SESSION MANAGEMENT  (calls wwebjs-api directly)
+// ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/whatsapp/sessions
+/**
+ * GET /api/whatsapp/sessions
+ * List all wwebjs sessions → returns { success, data: SessionStatus[] }
+ */
 whatsappRouter.get('/sessions', async (_req: Request, res: Response) => {
   try {
-    const { status, body } = await waApi('/session/getSessions');
-    res.status(status).json(body);
-  } catch (err) {
-    res.status(503).json({ error: 'WhatsApp API unavailable', detail: String(err) });
+    const upstream = await fetch(`${WA_API_URL}/session/getSessions`, {
+      headers: waHeaders(),
+    });
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ success: false, error: 'Could not fetch sessions' });
+    }
+    const data = await upstream.json();
+    // wwebjs-api returns an array; wrap it for consistency
+    const sessions = Array.isArray(data) ? data : (data.data || data.sessions || []);
+    res.json({ success: true, data: sessions });
+  } catch (err: any) {
+    res.status(503).json({ success: false, error: err.message });
   }
 });
 
-// GET /api/whatsapp/session/start/:sessionId
+/**
+ * GET /api/whatsapp/session/start/:sessionId
+ * Start a new wwebjs session. Returns immediately; poll /status for QR / CONNECTED.
+ */
 whatsappRouter.get('/session/start/:sessionId', async (req: Request, res: Response) => {
-  try {
-    const { status, body } = await waApi(`/session/start/${req.params.sessionId}`);
-    res.status(status).json(body);
-  } catch (err) {
-    res.status(503).json({ error: 'WhatsApp API unavailable', detail: String(err) });
-  }
+  await proxyJson(res, `${WA_API_URL}/session/start/${req.params.sessionId}`);
 });
 
-// GET /api/whatsapp/session/status/:sessionId
+/**
+ * GET /api/whatsapp/session/status/:sessionId
+ * Returns normalised status:
+ *   { success: true, data: { sessionId, state, authenticated, phone?, pushName?, qrCode? } }
+ *
+ * Possible `state` values from wwebjs-api:
+ *   SCAN_QR_CODE | CONNECTED | DISCONNECTED | INITIALIZING | FAILED
+ */
 whatsappRouter.get('/session/status/:sessionId', async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
   try {
-    const { status, body } = await waApi(`/session/status/${req.params.sessionId}`);
-    res.status(status).json(body);
-  } catch (err) {
-    res.status(503).json({ error: 'WhatsApp API unavailable', detail: String(err) });
-  }
-});
-
-// GET /api/whatsapp/session/qr/:sessionId
-// Proxies the QR image from wwebjs-api and returns it as a PNG
-// wwebjs-api serves the QR at: GET /session/qr/:id/image
-whatsappRouter.get('/session/qr/:sessionId', async (req: Request, res: Response) => {
-  try {
-    // Try /image endpoint first (standard wwebjs-api)
-    const upstream = await fetchWithTimeout(`${WA_API_URL}/session/qr/${req.params.sessionId}/image`, {
-      headers: { 'x-api-key': WA_API_KEY },
+    const upstream = await fetch(`${WA_API_URL}/session/status/${sessionId}`, {
+      headers: waHeaders(),
     });
 
     if (!upstream.ok) {
-      // Some versions serve base64 JSON instead — try that
-      const { status, body } = await waApi(`/session/qr/${req.params.sessionId}`);
-      if (body?.qr) {
-        // body.qr is a data URI: "data:image/png;base64,..."
-        const base64 = body.qr.replace(/^data:image\/\w+;base64,/, '');
-        const buf = Buffer.from(base64, 'base64');
-        res.set('Content-Type', 'image/png');
-        res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-        return res.send(buf);
-      }
-      return res.status(503).json({ error: 'WhatsApp API unavailable', detail: 'wwebjs-api service is not running. Please ensure the WhatsApp integration service is started.' });
+      // Session not found — return disconnected
+      return res.json({
+        success: true,
+        data: { sessionId, state: 'DISCONNECTED', authenticated: false },
+      });
     }
 
-    const contentType = upstream.headers.get('content-type') || 'image/png';
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    res.set('Content-Type', contentType);
-    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.send(buf);
-  } catch (err) {
-    console.error('[WhatsApp QR] Error:', err);
-    res.status(503).json({ error: 'WhatsApp API unavailable', detail: `Could not reach wwebjs-api at ${WA_API_URL}. Is it running?` });
+    const raw = await upstream.json();
+    // wwebjs-api shape: { success, data: { state, ... } }  OR  { state, ... }
+    const inner = raw?.data ?? raw;
+    const state: string = inner?.state || inner?.status || 'DISCONNECTED';
+
+    // Also fetch QR code data if in QR state (as base64 string, not image)
+    let qrCode: string | undefined;
+    if (state === 'SCAN_QR_CODE') {
+      try {
+        const qrRes = await fetch(`${WA_API_URL}/session/qr/${sessionId}`, {
+          headers: waHeaders(),
+        });
+        if (qrRes.ok) {
+          const qrData = await qrRes.json();
+          qrCode = qrData?.data?.qr || qrData?.qr;
+        }
+      } catch { /* ignore */ }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        sessionId,
+        state,
+        authenticated: state === 'CONNECTED',
+        phone: inner?.phone || inner?.phoneNumber,
+        pushName: inner?.pushName,
+        ...(qrCode ? { qrCode } : {}),
+      },
+    });
+  } catch (err: any) {
+    res.json({
+      success: true,
+      data: { sessionId, state: 'DISCONNECTED', authenticated: false },
+    });
   }
 });
 
-// GET /api/whatsapp/session/terminate/:sessionId
+/**
+ * GET /api/whatsapp/session/qr/:sessionId
+ * Proxies the QR PNG image from wwebjs-api → browser.
+ * wwebjs-api endpoint: GET /session/qr/:sessionId/image
+ */
+whatsappRouter.get('/session/qr/:sessionId', async (req: Request, res: Response) => {
+  await proxyImage(res, `${WA_API_URL}/session/qr/${req.params.sessionId}/image`);
+});
+
+/**
+ * GET /api/whatsapp/session/terminate/:sessionId
+ */
 whatsappRouter.get('/session/terminate/:sessionId', async (req: Request, res: Response) => {
-  try {
-    const { status, body } = await waApi(`/session/terminate/${req.params.sessionId}`);
-    res.status(status).json(body);
-  } catch (err) {
-    res.status(503).json({ error: 'WhatsApp API unavailable', detail: String(err) });
-  }
+  await proxyJson(res, `${WA_API_URL}/session/terminate/${req.params.sessionId}`);
 });
 
-// GET /api/whatsapp/session/restart/:sessionId
+/**
+ * GET /api/whatsapp/session/restart/:sessionId
+ */
 whatsappRouter.get('/session/restart/:sessionId', async (req: Request, res: Response) => {
-  try {
-    const { status, body } = await waApi(`/session/restart/${req.params.sessionId}`);
-    res.status(status).json(body);
-  } catch (err) {
-    res.status(503).json({ error: 'WhatsApp API unavailable', detail: String(err) });
-  }
+  await proxyJson(res, `${WA_API_URL}/session/restart/${req.params.sessionId}`);
 });
 
-// ── Chat + message proxy (admin inbox) ────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// CHATS  (calls whatsapp-service)
+// ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/whatsapp/chats
 whatsappRouter.get('/chats', async (req: Request, res: Response) => {
-  try {
-    const qs = new URLSearchParams(req.query as Record<string, string>).toString();
-    const { status, body } = await waSvc(`/api/chats${qs ? '?' + qs : ''}`);
-    res.status(status).json(body);
-  } catch {
-    res.status(503).json({ error: 'WhatsApp service unavailable' });
-  }
+  const qs = new URLSearchParams(req.query as Record<string, string>).toString();
+  await proxyJson(res, `${WA_SVC_URL}/chats${qs ? '?' + qs : ''}`);
 });
 
-// GET /api/whatsapp/messages
-// whatsapp-service uses /api/chats/messages  
 whatsappRouter.get('/messages', async (req: Request, res: Response) => {
-  try {
-    const qs = new URLSearchParams(req.query as Record<string, string>).toString();
-    const { status, body } = await waSvc(`/api/chats/messages${qs ? '?' + qs : ''}`);
-    res.status(status).json(body);
-  } catch {
-    res.status(503).json({ error: 'WhatsApp service unavailable' });
-  }
+  const qs = new URLSearchParams(req.query as Record<string, string>).toString();
+  // whatsapp-service stores messages under /chats/messages
+  await proxyJson(res, `${WA_SVC_URL}/chats/messages${qs ? '?' + qs : ''}`);
 });
 
-// POST /api/whatsapp/messages/send
-// whatsapp-service uses /api/chats/send
 whatsappRouter.post('/messages/send', async (req: Request, res: Response) => {
-  try {
-    const { status, body } = await waSvc('/api/chats/send', {
-      method: 'POST',
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(body);
-  } catch {
-    res.status(503).json({ error: 'WhatsApp service unavailable' });
-  }
+  await proxyJson(res, `${WA_SVC_URL}/chats/send`, {
+    method: 'POST',
+    body: JSON.stringify(req.body),
+  });
 });
 
-// POST /api/whatsapp/chats/claim
 whatsappRouter.post('/chats/claim', async (req: Request, res: Response) => {
-  try {
-    const { status, body } = await waSvc('/api/chats/claim', {
-      method: 'POST',
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(body);
-  } catch {
-    res.status(503).json({ error: 'WhatsApp service unavailable' });
-  }
+  await proxyJson(res, `${WA_SVC_URL}/chats/claim`, {
+    method: 'POST',
+    body: JSON.stringify(req.body),
+  });
 });
 
-// POST /api/whatsapp/chats/release
 whatsappRouter.post('/chats/release', async (req: Request, res: Response) => {
-  try {
-    const { status, body } = await waSvc('/api/chats/release', {
-      method: 'POST',
-      body: JSON.stringify(req.body),
-    });
-    res.status(status).json(body);
-  } catch {
-    res.status(503).json({ error: 'WhatsApp service unavailable' });
-  }
+  await proxyJson(res, `${WA_SVC_URL}/chats/release`, {
+    method: 'POST',
+    body: JSON.stringify(req.body),
+  });
 });
 
-// ── Incoming webhook from wwebjs-api ──────────────────────────────────────────
-
-whatsappRouter.post('/webhook', async (req: Request, res: Response) => {
-  res.status(200).json({ received: true });
-  try {
-    const event = req.body;
-    const dataType: string = event.dataType || event.type || '';
-    if (dataType !== 'message') return;
-
-    const msg = event.data || event;
-    const from: string = msg.from || '';
-    const body: string = msg.body || msg.text || '';
-    if (!from || !body || msg.fromMe || from.includes('@g.us')) return;
-
-    await fetch(`${WA_SVC_URL}/api/webhook/incoming`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': WA_API_KEY },
-      body: JSON.stringify({ sessionId: event.sessionId, from, body, message: msg }),
-    }).catch(() => null);
-  } catch (err) {
-    console.error('[WA Webhook]', err);
-  }
+whatsappRouter.get('/chats/context', async (req: Request, res: Response) => {
+  const qs = new URLSearchParams(req.query as Record<string, string>).toString();
+  await proxyJson(res, `${WA_SVC_URL}/chats/context${qs ? '?' + qs : ''}`);
 });
 
-// ── AI restaurant data endpoint ───────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// AI RESTAURANT DATA  (AI reads live menus from NovaGo DB)
+// ══════════════════════════════════════════════════════════════════════════════
 
 whatsappRouter.get('/restaurant-data', async (req: Request, res: Response) => {
   try {
@@ -244,23 +258,49 @@ whatsappRouter.get('/restaurant-data', async (req: Request, res: Response) => {
       include: { menuItems: { where: { isAvailable: true } } },
     });
     res.json(restaurants);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch restaurant data' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch restaurant data', detail: err.message });
   }
 });
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// INCOMING WEBHOOK  (wwebjs-api → NovaGo → whatsapp-service AI)
+// ══════════════════════════════════════════════════════════════════════════════
+
+whatsappRouter.post('/webhook', async (req: Request, res: Response) => {
+  res.status(200).json({ received: true });
+  try {
+    const event = req.body;
+    const dataType: string = event.dataType || event.type || '';
+    if (dataType !== 'message') return;
+    const msg = event.data || event;
+    if (!msg.from || !msg.body || msg.fromMe) return;
+    if ((msg.from as string).includes('@g.us')) return;
+
+    await fetch(`${WA_SVC_URL}/webhook/incoming`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(WA_API_KEY ? { 'x-api-key': WA_API_KEY } : {}) },
+      body: JSON.stringify({ sessionId: event.sessionId, from: msg.from, body: msg.body, message: msg }),
+    }).catch(() => null);
+  } catch (err) {
+    console.error('[WA Webhook] Error:', err);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HEALTH
+// ══════════════════════════════════════════════════════════════════════════════
 
 whatsappRouter.get('/health', async (_req: Request, res: Response) => {
   const [waApiOk, waSvcOk] = await Promise.all([
-    fetch(`${WA_API_URL}/ping`, { headers: { 'x-api-key': WA_API_KEY } }).then(r => r.ok).catch(() => false),
+    fetch(`${WA_API_URL}/ping`, { headers: waHeaders() }).then(r => r.ok).catch(() => false),
     fetch(`${WA_SVC_URL}/health`).then(r => r.ok).catch(() => false),
   ]);
   res.json({
-    status: 'ok',
+    success: true,
     waApi:    waApiOk ? 'up' : 'down',
     waService: waSvcOk ? 'up' : 'down',
-    waApiUrl: WA_API_URL,
-    waSvcUrl: WA_SVC_URL,
+    waApiUrl:  WA_API_URL,
+    waSvcUrl:  WA_SVC_URL,
   });
 });
