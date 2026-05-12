@@ -12,22 +12,43 @@ const waHeaders = () => ({
   'Content-Type': 'application/json',
 });
 
+// Helper to fetch with timeout
+async function fetchWithTimeout(url: string, opts: RequestInit = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function waApi(path: string, opts: RequestInit = {}) {
-  const res = await fetch(`${WA_API_URL}${path}`, {
-    ...opts,
-    headers: { ...waHeaders(), ...(opts.headers as Record<string, string> || {}) },
-  });
-  const body = await res.json().catch(() => ({}));
-  return { status: res.status, body };
+  try {
+    const res = await fetchWithTimeout(`${WA_API_URL}${path}`, {
+      ...opts,
+      headers: { ...waHeaders(), ...(opts.headers as Record<string, string> || {}) },
+    });
+    const body = await res.json().catch(() => ({}));
+    return { status: res.status, body };
+  } catch (err) {
+    console.error(`[WhatsApp API] Error calling ${WA_API_URL}${path}:`, err);
+    return { status: 503, body: { error: 'WhatsApp API service unavailable', service: 'wwebjs-api', url: WA_API_URL } };
+  }
 }
 
 async function waSvc(path: string, opts: RequestInit = {}) {
-  const res = await fetch(`${WA_SVC_URL}${path}`, {
-    ...opts,
-    headers: { ...waHeaders(), ...(opts.headers as Record<string, string> || {}) },
-  });
-  const body = await res.json().catch(() => ({}));
-  return { status: res.status, body };
+  try {
+    const res = await fetchWithTimeout(`${WA_SVC_URL}${path}`, {
+      ...opts,
+      headers: { ...waHeaders(), ...(opts.headers as Record<string, string> || {}) },
+    });
+    const body = await res.json().catch(() => ({}));
+    return { status: res.status, body };
+  } catch (err) {
+    console.error(`[WhatsApp Service] Error calling ${WA_SVC_URL}${path}:`, err);
+    return { status: 503, body: { error: 'WhatsApp service unavailable', service: 'whatsapp-service', url: WA_SVC_URL } };
+  }
 }
 
 // ── Session management (admin portal QR connect) ──────────────────────────────
@@ -68,13 +89,13 @@ whatsappRouter.get('/session/status/:sessionId', async (req: Request, res: Respo
 whatsappRouter.get('/session/qr/:sessionId', async (req: Request, res: Response) => {
   try {
     // Try /image endpoint first (standard wwebjs-api)
-    const upstream = await fetch(`${WA_API_URL}/session/qr/${req.params.sessionId}/image`, {
+    const upstream = await fetchWithTimeout(`${WA_API_URL}/session/qr/${req.params.sessionId}/image`, {
       headers: { 'x-api-key': WA_API_KEY },
     });
 
     if (!upstream.ok) {
       // Some versions serve base64 JSON instead — try that
-      const { body } = await waApi(`/session/qr/${req.params.sessionId}`);
+      const { status, body } = await waApi(`/session/qr/${req.params.sessionId}`);
       if (body?.qr) {
         // body.qr is a data URI: "data:image/png;base64,..."
         const base64 = body.qr.replace(/^data:image\/\w+;base64,/, '');
@@ -83,7 +104,7 @@ whatsappRouter.get('/session/qr/:sessionId', async (req: Request, res: Response)
         res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
         return res.send(buf);
       }
-      return res.status(upstream.status).json({ error: 'QR not ready yet — still initializing' });
+      return res.status(503).json({ error: 'WhatsApp API unavailable', detail: 'wwebjs-api service is not running. Please ensure the WhatsApp integration service is started.' });
     }
 
     const contentType = upstream.headers.get('content-type') || 'image/png';
@@ -92,7 +113,8 @@ whatsappRouter.get('/session/qr/:sessionId', async (req: Request, res: Response)
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.send(buf);
   } catch (err) {
-    res.status(503).json({ error: 'WhatsApp API unavailable', detail: String(err) });
+    console.error('[WhatsApp QR] Error:', err);
+    res.status(503).json({ error: 'WhatsApp API unavailable', detail: `Could not reach wwebjs-api at ${WA_API_URL}. Is it running?` });
   }
 });
 

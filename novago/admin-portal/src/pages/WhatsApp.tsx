@@ -189,13 +189,15 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
 
     if (!data && data !== false) {
       // null = network error / backend not reachable
-      setError('Cannot reach the NovaGo backend. Make sure it is running on port 4000.');
+      setError('Cannot reach WhatsApp service. Make sure wwebjs-api is running on port 3000 or set WA_API_URL environment variable.');
       setStatus('IDLE');
       return;
     }
 
     if (data?.error) {
-      setError(data.error);
+      setError(data.error === 'WhatsApp API unavailable' 
+        ? `WhatsApp API service unavailable. The backend tried to reach: ${data.url}. Please ensure wwebjs-api is running.`
+        : data.error);
       setStatus('IDLE');
       return;
     }
