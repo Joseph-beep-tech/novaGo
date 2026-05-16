@@ -28,9 +28,8 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../../utils/prisma';
 
-const prisma = new PrismaClient();
 export const whatsappRouter = Router();
 
 const WA_API_URL = process.env.WA_API_URL  || 'http://localhost:3000';   // wwebjs-api

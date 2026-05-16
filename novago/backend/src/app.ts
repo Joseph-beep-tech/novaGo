@@ -15,8 +15,17 @@ import { whatsappRouter } from './modules/whatsapp/whatsapp.routes';
 export function createApp() {
   const app = express();
 
-  app.use(helmet());
-  app.use(cors());
+  app.use(helmet({ crossOriginResourcePolicy: false }));
+
+  // Allow the admin portal (Vite dev on 5173, or any configured origin)
+  app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+    credentials: false,
+  }));
+  app.options('*', cors());
+
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
   app.use(morgan('dev'));

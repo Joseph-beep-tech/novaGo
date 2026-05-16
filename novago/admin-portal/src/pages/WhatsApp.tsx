@@ -1,11 +1,10 @@
 /**
  * WhatsApp.tsx — NovaGo Admin Portal WhatsApp Page
  *
- * ALL API calls go through  VITE_API_URL/api/whatsapp/...  (NovaGo backend proxy)
- * No direct calls to port 3000 or 3001 from the browser.
+ * Uses the same axios `api` instance as every other admin page —
+ * baseURL already set to VITE_API_URL (default http://localhost:4000).
  *
- * Session status values from wwebjs-api:
- *   SCAN_QR_CODE | CONNECTED | DISCONNECTED | INITIALIZING | FAILED
+ * Backend proxy at /api/whatsapp/* forwards to wwebjs-api and whatsapp-service.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
@@ -15,22 +14,18 @@ import {
   Zap, Paperclip, X, ShoppingBag, Clock, Info,
   Wifi, WifiOff, AlertTriangle, Plus, RotateCcw,
 } from 'lucide-react';
-
-// ── All calls proxied through NovaGo backend ──────────────────────────────────
-const NOVA_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000';
-const WA_PROXY = `${NOVA_URL}/api/whatsapp`;
+import api from '../services/api';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-type SessionState = 'CONNECTED' | 'DISCONNECTED' | 'SCAN_QR_CODE' | 'INITIALIZING' | 'FAILED' | 'LOADING';
+type SessionState = 'CONNECTED' | 'DISCONNECTED' | 'SCAN_QR_CODE' | 'INITIALIZING' | 'FAILED';
 
 interface WaSession {
   sessionId: string;
   state: SessionState;
   phone?: string;
   pushName?: string;
-  qrObjectUrl?: string;   // blob URL for the QR image
+  qrObjectUrl?: string;
 }
-
 interface Chat {
   id: string; identifier: string; platform: string;
   contactName: string; contactPhone: string;
@@ -45,7 +40,7 @@ interface Message {
 }
 interface Order { id: string; status: string; total: number; }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Colour helpers ────────────────────────────────────────────────────────────
 const COLORS = [
   { bg: '#E1F5EE', fg: '#0F6E56' }, { bg: '#ede9fe', fg: '#5b21b6' },
   { bg: '#dbeafe', fg: '#1e40af' }, { bg: '#fef3c7', fg: '#d97706' },
@@ -61,10 +56,8 @@ function ago(ts: string) {
   if (d < 86400) return `${Math.floor(d / 3600)}h`; return `${Math.floor(d / 86400)}d`;
 }
 function fmt(ts: string) {
-  try { return new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }); }
-  catch { return ''; }
+  try { return new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
 }
-
 function normaliseState(raw: string): SessionState {
   const s = (raw || '').toUpperCase();
   if (s === 'CONNECTED' || s === 'READY') return 'CONNECTED';
@@ -74,172 +67,145 @@ function normaliseState(raw: string): SessionState {
   return 'DISCONNECTED';
 }
 
-// ── Fetch helpers (all through NovaGo proxy) ──────────────────────────────────
-async function waFetch(path: string, opts: RequestInit = {}): Promise<any> {
+// ── API helpers using the shared axios instance ───────────────────────────────
+async function waGet(path: string): Promise<any> {
   try {
-    const token = localStorage.getItem('novago_token') || '';
-    const res = await fetch(`${WA_PROXY}${path}`, {
-      ...opts,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(opts.headers as Record<string, string> || {}),
-      },
-    });
-    if (!res.ok) {
-      console.warn(`[WA] ${path} → HTTP ${res.status}`);
-      return null;
-    }
-    return res.json();
+    const res = await api.get(`/api/whatsapp${path}`);
+    return res.data;
   } catch (e: any) {
-    console.error(`[WA] ${path} error:`, e.message);
+    console.warn(`[WA GET] ${path}`, e?.response?.status, e?.message);
+    return null;
+  }
+}
+async function waPost(path: string, body: object): Promise<any> {
+  try {
+    const res = await api.post(`/api/whatsapp${path}`, body);
+    return res.data;
+  } catch (e: any) {
+    console.warn(`[WA POST] ${path}`, e?.response?.status, e?.message);
     return null;
   }
 }
 
-// Fetch QR image as blob URL (so <img src> works without CORS)
-async function fetchQrImage(sessionId: string): Promise<string | null> {
+// QR image needs a raw fetch because we need a Blob, not JSON.
+// We build the URL the same way axios does (baseURL + path).
+async function fetchQrBlob(sessionId: string): Promise<string | null> {
   try {
-    const token = localStorage.getItem('novago_token') || '';
-    const res = await fetch(`${WA_PROXY}/session/qr/${sessionId}`, {
+    const baseURL: string = (api.defaults.baseURL as string || 'http://localhost:4000').replace(/\/$/, '');
+    const token = localStorage.getItem('auth_token') || '';
+    const url = `${baseURL}/api/whatsapp/session/qr/${sessionId}`;
+    const res = await fetch(url, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (!res.ok) return null;
     const blob = await res.blob();
-    if (blob.size < 100) return null;   // empty / error response
+    if (blob.size < 50) return null;
     return URL.createObjectURL(blob);
-  } catch { return null; }
-}
-
-async function novaFetch(path: string): Promise<any> {
-  try {
-    const token = localStorage.getItem('novago_token') || '';
-    const res = await fetch(`${NOVA_URL}${path}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    return res.ok ? res.json() : null;
   } catch { return null; }
 }
 
 const QUICK_REPLIES = [
   { emoji: '🏍️', label: 'Order on its way', text: 'Your order is on the way and will arrive in about 25 minutes!' },
-  { emoji: '🙏', label: 'Apologise', text: 'We sincerely apologise for the inconvenience. Let me fix this for you right away.' },
+  { emoji: '🙏', label: 'Apologise', text: 'We sincerely apologise for the inconvenience. Let me fix this right away.' },
   { emoji: '💸', label: 'Refund processed', text: 'Your refund has been processed and will reflect within 24 hours.' },
   { emoji: '👍', label: 'Thank customer', text: 'Thank you for ordering with NovaGo! Is there anything else I can help you with?' },
-  { emoji: '📞', label: 'Escalate', text: "I'm escalating this to our team. You will hear from us within 15 minutes." },
+  { emoji: '📞', label: 'Escalate', text: "I'm escalating this to our team. You'll hear from us within 15 minutes." },
 ];
 
 // ─── QR Connect Panel ─────────────────────────────────────────────────────────
 function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void }) {
-  const [session, setSession] = useState<WaSession | null>(null);
+  const [session, setSession]   = useState<WaSession | null>(null);
   const [sessionId, setSessionId] = useState('novago-main');
   const [starting, setStarting] = useState(false);
-  const [error, setError] = useState('');
-  const pollRef = useRef<ReturnType<typeof setInterval>>();
-  const prevQrUrl = useRef<string>('');
-  const pollCount = useRef(0);
+  const [error, setError]       = useState('');
+  const pollRef   = useRef<ReturnType<typeof setInterval>>();
+  const prevQrUrl = useRef('');
+  const pollTick  = useRef(0);
 
-  const revokeQr = (url?: string) => {
-    const u = url || prevQrUrl.current;
-    if (u) { URL.revokeObjectURL(u); }
-    if (u === prevQrUrl.current) prevQrUrl.current = '';
+  const revokeOldQr = () => {
+    if (prevQrUrl.current) { URL.revokeObjectURL(prevQrUrl.current); prevQrUrl.current = ''; }
   };
 
   const pollStatus = useCallback(async (sid: string) => {
-    pollCount.current++;
-    const data = await waFetch(`/session/status/${sid}`);
+    pollTick.current++;
+    const data = await waGet(`/session/status/${sid}`);
     if (!data) return;
 
-    // Backend returns { success, data: { sessionId, state, authenticated, phone?, pushName? } }
+    // shape: { success, data: { sessionId, state, phone, pushName } }
     const inner = data?.data ?? data;
-    const rawState: string = inner?.state || inner?.status || '';
-    const state = normaliseState(rawState);
+    const state = normaliseState(inner?.state || inner?.status || '');
 
     let qrObjectUrl: string | undefined;
-
-    if (state === 'SCAN_QR_CODE') {
-      // Fetch QR image every 5 polls to avoid hammering
-      if (pollCount.current % 2 === 1) {
-        const url = await fetchQrImage(sid);
-        if (url) {
-          revokeQr(prevQrUrl.current);
-          prevQrUrl.current = url;
-          qrObjectUrl = url;
-        }
-      }
+    if (state === 'SCAN_QR_CODE' && pollTick.current % 2 === 1) {
+      const url = await fetchQrBlob(sid);
+      if (url) { revokeOldQr(); prevQrUrl.current = url; qrObjectUrl = url; }
     }
 
     setSession(prev => ({
       ...(prev ?? { sessionId: sid }),
-      sessionId: sid,
-      state,
-      phone: inner?.phone ?? prev?.phone,
-      pushName: inner?.pushName ?? prev?.pushName,
+      sessionId: sid, state,
+      phone:      inner?.phone    ?? prev?.phone,
+      pushName:   inner?.pushName ?? prev?.pushName,
       qrObjectUrl: qrObjectUrl ?? (state === 'SCAN_QR_CODE' ? prev?.qrObjectUrl : undefined),
     }));
 
     if (state === 'CONNECTED') {
       clearInterval(pollRef.current);
-      revokeQr();
+      revokeOldQr();
       onConnected(inner?.phone);
     }
   }, [onConnected]);
 
-  // Check for existing sessions on mount
+  // Check for existing session on mount
   useEffect(() => {
     (async () => {
-      const res = await waFetch('/sessions');
+      const res = await waGet('/sessions');
       if (!res) return;
       const list: any[] = Array.isArray(res) ? res : (res?.data ?? []);
       if (list.length > 0) {
-        const s = list[0];
+        const s   = list[0];
         const sid = s.sessionId || s.id || 'novago-main';
         setSessionId(sid);
-        const state = normaliseState(s.state || s.status || '');
-        setSession({ sessionId: sid, state });
+        setSession({ sessionId: sid, state: normaliseState(s.state || s.status || '') });
         pollRef.current = setInterval(() => pollStatus(sid), 4000);
       }
     })();
-    return () => { clearInterval(pollRef.current); revokeQr(); };
+    return () => { clearInterval(pollRef.current); revokeOldQr(); };
   }, [pollStatus]);
 
   const handleConnect = async () => {
     if (!sessionId.trim()) return;
-    setError('');
-    setStarting(true);
+    setError(''); setStarting(true);
     clearInterval(pollRef.current);
-    pollCount.current = 0;
+    pollTick.current = 0;
 
-    const res = await waFetch(`/session/start/${sessionId.trim()}`);
+    const res = await waGet(`/session/start/${sessionId.trim()}`);
     setStarting(false);
 
     if (res === null) {
       setError(
-        'Cannot connect to session. Make sure the NovaGo backend is running on port 4000 ' +
-        'and WA_API_URL / WA_SVC_URL are set correctly in the backend .env file.'
+        'The backend could not reach the WhatsApp API (wwebjs-api). ' +
+        'Make sure wwebjs-api is running and WA_API_URL is set in the backend .env file.'
       );
       return;
     }
 
     setSession({ sessionId: sessionId.trim(), state: 'INITIALIZING' });
-    // Poll every 3 seconds
     pollRef.current = setInterval(() => pollStatus(sessionId.trim()), 3000);
   };
 
   const handleRegenerate = async () => {
     clearInterval(pollRef.current);
-    revokeQr();
+    revokeOldQr();
     setSession(prev => prev ? { ...prev, state: 'INITIALIZING', qrObjectUrl: undefined } : null);
-    await waFetch(`/session/terminate/${sessionId}`);
+    await waGet(`/session/terminate/${sessionId}`);
     await new Promise(r => setTimeout(r, 1500));
     await handleConnect();
   };
 
-  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="flex flex-col items-center justify-center h-full p-8 bg-gray-50">
       <div className="w-full max-w-md">
-        {/* Header */}
         <div className="text-center mb-8">
           <div className="w-16 h-16 bg-green-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
             <MessageSquare className="w-8 h-8 text-green-600" />
@@ -252,12 +218,10 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
 
         <div className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
 
-          {/* Session name input */}
+          {/* Session name input — only when not active */}
           {(!session || session.state === 'DISCONNECTED' || session.state === 'FAILED') && (
             <div className="p-6 border-b border-gray-100">
-              <label className="block text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">
-                Session Name
-              </label>
+              <label className="block text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">Session Name</label>
               <div className="flex gap-2">
                 <input
                   value={sessionId}
@@ -267,8 +231,7 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
                   placeholder="novago-main"
                 />
                 <button
-                  onClick={handleConnect}
-                  disabled={starting || !sessionId.trim()}
+                  onClick={handleConnect} disabled={starting || !sessionId.trim()}
                   className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-semibold hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   {starting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
@@ -292,13 +255,13 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
                 <p className="text-sm">Enter a session name and click Connect</p>
               </div>
 
-            ) : session.state === 'INITIALIZING' || session.state === 'LOADING' ? (
+            ) : (session.state === 'INITIALIZING') ? (
               <div className="text-center py-10">
                 <Loader2 className="w-10 h-10 animate-spin text-green-600 mx-auto mb-4" />
                 <p className="font-semibold text-gray-800 text-base">Starting session…</p>
                 <p className="text-sm text-gray-400 mt-1">Generating QR code, please wait</p>
                 <div className="mt-4 flex gap-1 justify-center">
-                  {[0, 1, 2].map(i => (
+                  {[0,1,2].map(i => (
                     <span key={i} className="w-1.5 h-1.5 bg-green-400 rounded-full animate-bounce"
                       style={{ animationDelay: `${i * 0.15}s` }} />
                   ))}
@@ -311,31 +274,23 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
                   <QrCode className="w-4 h-4 text-amber-500" />
                   Scan with WhatsApp to link your number
                 </p>
-
                 {session.qrObjectUrl ? (
-                  <img
-                    src={session.qrObjectUrl}
-                    alt="WhatsApp QR code — scan to connect"
-                    className="w-56 h-56 mx-auto rounded-xl border-4 border-white shadow-lg"
-                  />
+                  <img src={session.qrObjectUrl} alt="WhatsApp QR code"
+                    className="w-56 h-56 mx-auto rounded-xl border-4 border-white shadow-lg" />
                 ) : (
                   <div className="w-56 h-56 mx-auto rounded-xl bg-gray-50 border-2 border-dashed border-gray-200 flex flex-col items-center justify-center gap-2">
                     <Loader2 className="w-8 h-8 animate-spin text-green-500" />
                     <p className="text-xs text-gray-400">Loading QR code…</p>
                   </div>
                 )}
-
                 <div className="mt-5 bg-amber-50 border border-amber-200 rounded-lg p-3 text-left text-xs text-amber-800 space-y-1">
                   <p className="font-semibold">How to scan:</p>
                   <p>1. Open WhatsApp on your phone</p>
                   <p>2. Tap ⋮ Menu → Linked Devices</p>
                   <p>3. Tap "Link a device" and scan this QR code</p>
                 </div>
-
-                <button
-                  onClick={handleRegenerate}
-                  className="mt-4 text-xs text-gray-400 hover:text-green-600 flex items-center gap-1.5 mx-auto transition-colors"
-                >
+                <button onClick={handleRegenerate}
+                  className="mt-4 text-xs text-gray-400 hover:text-green-600 flex items-center gap-1.5 mx-auto transition-colors">
                   <RotateCcw className="w-3 h-3" /> QR expired? Regenerate
                 </button>
               </div>
@@ -361,17 +316,15 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
                   </div>
                 </div>
                 <button onClick={handleRegenerate}
-                  className="mt-4 text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1.5 mx-auto transition-colors">
+                  className="mt-4 text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1.5 mx-auto">
                   <RefreshCw className="w-3 h-3" /> Reconnect / Switch number
                 </button>
               </div>
 
             ) : (
-              /* DISCONNECTED / FAILED */
               <div className="text-center py-6">
                 <XCircle className="w-12 h-12 text-red-400 mx-auto mb-3" />
                 <p className="font-semibold text-gray-800">Session Disconnected</p>
-                <p className="text-sm text-gray-400 mt-1">The WhatsApp session was lost</p>
                 {error && (
                   <div className="mt-3 mx-auto max-w-xs flex items-start gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-left">
                     <AlertTriangle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
@@ -393,19 +346,18 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
               <span>Session: <code className="bg-gray-100 px-1.5 py-0.5 rounded font-mono">{session.sessionId}</code></span>
               <div className="flex items-center gap-1.5">
                 {session.state === 'CONNECTED'
-                  ? <><Wifi className="w-3 h-3 text-green-500" /><span className="text-green-600 font-medium">Live</span></>
-                  : <><WifiOff className="w-3 h-3 text-red-400" /><span className="text-red-500">{session.state}</span></>}
+                  ? <><Wifi className="w-3 h-3 text-green-500"/><span className="text-green-600 font-medium">Live</span></>
+                  : <><WifiOff className="w-3 h-3 text-red-400"/><span className="text-red-500">{session.state}</span></>}
               </div>
             </div>
           )}
         </div>
 
-        {/* Feature pills */}
         <div className="mt-6 grid grid-cols-3 gap-3">
           {[
-            { icon: Bot,           label: 'AI Ordering',   desc: 'Reads live menus & prices' },
-            { icon: MessageSquare, label: 'Live Inbox',    desc: 'Admin chat takeover' },
-            { icon: ShoppingBag,   label: 'Real Orders',   desc: 'Synced to dashboard' },
+            { icon: Bot,           label: 'AI Ordering',  desc: 'Reads live menus & prices' },
+            { icon: MessageSquare, label: 'Live Inbox',   desc: 'Admin chat takeover' },
+            { icon: ShoppingBag,   label: 'Real Orders',  desc: 'Synced to dashboard' },
           ].map(f => (
             <div key={f.label} className="bg-white rounded-xl border border-gray-100 p-3 text-center shadow-sm">
               <f.icon className="w-5 h-5 text-green-600 mx-auto mb-1.5" />
@@ -421,46 +373,41 @@ function QRConnectPanel({ onConnected }: { onConnected: (phone?: string) => void
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 export default function WhatsApp() {
-  const [tab, setTab]                     = useState<'connect' | 'inbox'>('connect');
-  const [connected, setConnected]         = useState(false);
+  const [tab, setTab]                       = useState<'connect' | 'inbox'>('connect');
+  const [connected, setConnected]           = useState(false);
   const [connectedPhone, setConnectedPhone] = useState('');
-  const [chats, setChats]                 = useState<Chat[]>([]);
-  const [selectedChat, setSelectedChat]   = useState<Chat | null>(null);
-  const [messages, setMessages]           = useState<Message[]>([]);
-  const [orders, setOrders]               = useState<Order[]>([]);
-  const [filter, setFilter]               = useState('all');
-  const [search, setSearch]               = useState('');
-  const [inputText, setInputText]         = useState('');
-  const [inputMode, setInputMode]         = useState<'reply' | 'note'>('reply');
-  const [isClaimed, setIsClaimed]         = useState(false);
-  const [claimLoading, setClaimLoading]   = useState(false);
-  const [quickOpen, setQuickOpen]         = useState(false);
-  const [loadingMsgs, setLoadingMsgs]     = useState(false);
-  const [loadingChats, setLoadingChats]   = useState(false);
+  const [chats, setChats]                   = useState<Chat[]>([]);
+  const [selectedChat, setSelectedChat]     = useState<Chat | null>(null);
+  const [messages, setMessages]             = useState<Message[]>([]);
+  const [orders, setOrders]                 = useState<Order[]>([]);
+  const [filter, setFilter]                 = useState('all');
+  const [search, setSearch]                 = useState('');
+  const [inputText, setInputText]           = useState('');
+  const [inputMode, setInputMode]           = useState<'reply' | 'note'>('reply');
+  const [isClaimed, setIsClaimed]           = useState(false);
+  const [claimLoading, setClaimLoading]     = useState(false);
+  const [quickOpen, setQuickOpen]           = useState(false);
+  const [loadingMsgs, setLoadingMsgs]       = useState(false);
+  const [loadingChats, setLoadingChats]     = useState(false);
   const msgEndRef   = useRef<HTMLDivElement>(null);
   const taRef       = useRef<HTMLTextAreaElement>(null);
   const chatPollRef = useRef<ReturnType<typeof setInterval>>();
   const msgPollRef  = useRef<ReturnType<typeof setInterval>>();
 
-  // Check existing connected session on mount
+  // Check for already-connected session on mount
   useEffect(() => {
     (async () => {
-      const res = await waFetch('/sessions');
+      const res = await waGet('/sessions');
       if (!res) return;
       const list: any[] = Array.isArray(res) ? res : (res?.data ?? []);
-      const connected = list.find((s: any) => normaliseState(s.state || s.status || '') === 'CONNECTED');
-      if (connected) {
-        setConnected(true);
-        setConnectedPhone(connected.phone || '');
-        setTab('inbox');
-      }
+      const live = list.find((s: any) => normaliseState(s.state || s.status || '') === 'CONNECTED');
+      if (live) { setConnected(true); setConnectedPhone(live.phone || ''); setTab('inbox'); }
     })();
   }, []);
 
-  // ── Fetch chats ──────────────────────────────────────────────────────────────
   const fetchChats = useCallback(async () => {
     setLoadingChats(true);
-    const data = await waFetch(`/chats?filter=${filter}&limit=60`);
+    const data = await waGet(`/chats?filter=${filter}&limit=60`);
     if (data) {
       const raw: any[] = Array.isArray(data) ? data : (data.chats || data.data || []);
       setChats(raw.map((c: any) => ({
@@ -488,10 +435,9 @@ export default function WhatsApp() {
     return () => clearInterval(chatPollRef.current);
   }, [tab, fetchChats]);
 
-  // ── Fetch messages ───────────────────────────────────────────────────────────
   const fetchMessages = useCallback(async (chat: Chat) => {
     setLoadingMsgs(true);
-    const data = await waFetch(`/messages?identifier=${encodeURIComponent(chat.identifier)}&platform=${chat.platform}&limit=50`);
+    const data = await waGet(`/messages?identifier=${encodeURIComponent(chat.identifier)}&platform=${chat.platform}&limit=50`);
     if (data) {
       const raw: any[] = Array.isArray(data) ? data : (data.messages || data.data || []);
       setMessages(raw.map((m: any) => ({
@@ -509,41 +455,35 @@ export default function WhatsApp() {
 
   const selectChat = async (chat: Chat) => {
     clearInterval(msgPollRef.current);
-    setSelectedChat(chat);
-    setIsClaimed(!!chat.assignedTo);
+    setSelectedChat(chat); setIsClaimed(!!chat.assignedTo);
     setMessages([]); setOrders([]); setInputText('');
     await fetchMessages(chat);
-    const ords = await novaFetch(`/api/orders?customerPhone=${encodeURIComponent(chat.contactPhone)}`);
-    if (ords) setOrders((Array.isArray(ords) ? ords : (ords.data || [])).slice(0, 3));
+    try {
+      const ords = await api.get(`/api/orders?customerPhone=${encodeURIComponent(chat.contactPhone)}`);
+      const list = Array.isArray(ords.data) ? ords.data : (ords.data?.data || []);
+      setOrders(list.slice(0, 3));
+    } catch { /* no orders is fine */ }
     msgPollRef.current = setInterval(() => fetchMessages(chat), 5000);
   };
 
   useEffect(() => () => clearInterval(msgPollRef.current), []);
 
-  // ── Claim / Release ──────────────────────────────────────────────────────────
   const handleTakeover = async () => {
     if (!selectedChat) return;
     setClaimLoading(true);
     const adminId = localStorage.getItem('novago_admin_id') || 'admin';
     if (isClaimed) {
-      await waFetch('/chats/release', {
-        method: 'POST',
-        body: JSON.stringify({ identifier: selectedChat.identifier, platform: selectedChat.platform }),
-      });
+      await waPost('/chats/release', { identifier: selectedChat.identifier, platform: selectedChat.platform });
       setIsClaimed(false);
       pushSys('Released back to AI — NovaGo AI has resumed');
     } else {
-      const res = await waFetch('/chats/claim', {
-        method: 'POST',
-        body: JSON.stringify({ identifier: selectedChat.identifier, platform: selectedChat.platform, agentId: adminId }),
-      });
+      const res = await waPost('/chats/claim', { identifier: selectedChat.identifier, platform: selectedChat.platform, agentId: adminId });
       if (res) { setIsClaimed(true); pushSys('You claimed this conversation — AI is paused'); }
     }
     setClaimLoading(false);
     fetchChats();
   };
 
-  // ── Send message ─────────────────────────────────────────────────────────────
   const handleSend = async () => {
     const text = inputText.trim();
     if (!text || !selectedChat) return;
@@ -552,10 +492,7 @@ export default function WhatsApp() {
         timestamp: new Date().toISOString(), sender: { type: 'agent', name: 'Admin' }, isFromMe: true });
     } else {
       if (!isClaimed) await handleTakeover();
-      await waFetch('/messages/send', {
-        method: 'POST',
-        body: JSON.stringify({ identifier: selectedChat.identifier, platform: selectedChat.platform, content: text, contentType: 'text' }),
-      });
+      await waPost('/messages/send', { identifier: selectedChat.identifier, platform: selectedChat.platform, content: text, contentType: 'text' });
       pushMsg({ id: `sent-${Date.now()}`, content: text, contentType: 'text',
         timestamp: new Date().toISOString(), sender: { type: 'agent', name: 'Admin' }, isFromMe: true });
     }
@@ -575,7 +512,6 @@ export default function WhatsApp() {
   };
 
   const totalUnread = chats.reduce((s, c) => s + c.unreadCount, 0);
-
   const filteredChats = chats.filter(c => {
     if (search) {
       const q = search.toLowerCase();
@@ -589,10 +525,9 @@ export default function WhatsApp() {
     return true;
   });
 
-  // ─── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="h-full flex flex-col">
-      {/* Header */}
+      {/* Page header */}
       <div className="bg-white border-b border-gray-200 px-6 py-4 flex items-center gap-4 flex-shrink-0">
         <MessageSquare className="w-5 h-5 text-green-600" />
         <h1 className="text-lg font-bold text-gray-900">WhatsApp</h1>
@@ -604,9 +539,7 @@ export default function WhatsApp() {
           <button onClick={() => setTab('inbox')}
             className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${tab === 'inbox' ? 'bg-green-600 text-white' : 'text-gray-600 hover:bg-gray-100'}`}>
             Inbox
-            {totalUnread > 0 && (
-              <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full font-bold">{totalUnread}</span>
-            )}
+            {totalUnread > 0 && <span className="bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full font-bold">{totalUnread}</span>}
           </button>
         </div>
         {connected && (
@@ -618,12 +551,10 @@ export default function WhatsApp() {
         )}
       </div>
 
-      {/* Body */}
       <div className="flex-1 overflow-hidden">
-        {tab === 'connect' ? (
-          <QRConnectPanel onConnected={onConnected} />
-        ) : (
+        {tab === 'connect' ? <QRConnectPanel onConnected={onConnected} /> : (
           <div className="flex h-full">
+
             {/* Chat list */}
             <div className="w-72 border-r border-gray-200 flex flex-col bg-white flex-shrink-0">
               <div className="p-3 border-b border-gray-100">
@@ -635,10 +566,9 @@ export default function WhatsApp() {
                 </div>
               </div>
               <div className="flex gap-1.5 px-3 py-2 border-b border-gray-100 overflow-x-auto">
-                {['all', 'pending', 'mine', 'ai', 'groups'].map(f => (
+                {['all','pending','mine','ai','groups'].map(f => (
                   <button key={f} onClick={() => setFilter(f)}
-                    className={`px-2.5 py-1 rounded-full text-[11px] font-medium whitespace-nowrap transition-colors ${
-                      filter === f ? 'bg-green-100 text-green-700 border border-green-200' : 'border border-gray-200 text-gray-500 hover:text-gray-700'}`}>
+                    className={`px-2.5 py-1 rounded-full text-[11px] font-medium whitespace-nowrap transition-colors ${filter === f ? 'bg-green-100 text-green-700 border border-green-200' : 'border border-gray-200 text-gray-500 hover:text-gray-700'}`}>
                     {f === 'ai' ? 'AI Active' : f.charAt(0).toUpperCase() + f.slice(1)}
                   </button>
                 ))}
@@ -652,8 +582,7 @@ export default function WhatsApp() {
                 ) : filteredChats.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-32 text-gray-300 gap-2 px-4 text-center">
                     <MessageSquare className="w-8 h-8 opacity-40" />
-                    <p className="text-xs">No conversations yet</p>
-                    {!connected && <p className="text-xs">Connect WhatsApp first to see customer chats</p>}
+                    <p className="text-xs">{connected ? 'No conversations yet' : 'Connect WhatsApp first'}</p>
                   </div>
                 ) : filteredChats.map(chat => {
                   const c = clr(chat.contactName);
@@ -663,9 +592,7 @@ export default function WhatsApp() {
                     <button key={chat.id} onClick={() => selectChat(chat)}
                       className={`w-full flex items-start gap-2.5 p-3 text-left border-b border-gray-50 transition-colors ${isSelected ? 'bg-green-50 border-l-2 border-l-green-600' : 'hover:bg-gray-50'}`}>
                       <div className="relative flex-shrink-0">
-                        <div className="w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: c.bg, color: c.fg }}>
-                          {ini(chat.contactName)}
-                        </div>
+                        <div className="w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: c.bg, color: c.fg }}>{ini(chat.contactName)}</div>
                         <span className={`absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full border-2 border-white ${isAI ? 'bg-purple-500' : 'bg-blue-500'}`} />
                       </div>
                       <div className="flex-1 min-w-0">
@@ -676,7 +603,7 @@ export default function WhatsApp() {
                         <p className="text-xs text-gray-500 truncate mt-0.5">{chat.lastMessage}</p>
                         <div className="flex items-center gap-1 mt-1">
                           <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold ${isAI ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
-                            {isAI ? <><Bot className="w-2.5 h-2.5" />AI</> : <><User className="w-2.5 h-2.5" />Agent</>}
+                            {isAI ? <><Bot className="w-2.5 h-2.5"/>AI</> : <><User className="w-2.5 h-2.5"/>Agent</>}
                           </span>
                           {chat.unreadCount > 0 && (
                             <span className="ml-auto bg-green-600 text-white text-[10px] font-bold min-w-[17px] h-[17px] rounded-full flex items-center justify-center px-1">{chat.unreadCount}</span>
@@ -698,7 +625,6 @@ export default function WhatsApp() {
                 </div>
               ) : (
                 <>
-                  {/* Thread header */}
                   <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-200 bg-white flex-shrink-0">
                     <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
                       style={{ background: clr(selectedChat.contactName).bg, color: clr(selectedChat.contactName).fg }}>
@@ -707,25 +633,19 @@ export default function WhatsApp() {
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-semibold text-gray-900">{selectedChat.contactName}</p>
                       <p className="text-xs text-gray-500 flex items-center gap-1">
-                        {isClaimed ? <><User className="w-3 h-3" />Agent active</> : <><Bot className="w-3 h-3" />AI handling</>}
+                        {isClaimed ? <><User className="w-3 h-3"/>Agent active</> : <><Bot className="w-3 h-3"/>AI handling</>}
                         <span className="mx-1">·</span>{selectedChat.contactPhone}
                       </p>
                     </div>
                     <button onClick={handleTakeover} disabled={claimLoading}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-                        claimLoading ? 'opacity-50 cursor-not-allowed bg-gray-100 text-gray-400'
-                          : isClaimed ? 'bg-blue-100 text-blue-700 hover:bg-blue-200'
-                          : 'bg-green-600 text-white hover:bg-green-700'}`}>
-                      {claimLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        : isClaimed ? <><Bot className="w-3.5 h-3.5" />Release to AI</>
-                        : <><UserCheck className="w-3.5 h-3.5" />Claim</>}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${claimLoading ? 'opacity-50 cursor-not-allowed bg-gray-100 text-gray-400' : isClaimed ? 'bg-blue-100 text-blue-700 hover:bg-blue-200' : 'bg-green-600 text-white hover:bg-green-700'}`}>
+                      {claimLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin"/> : isClaimed ? <><Bot className="w-3.5 h-3.5"/>Release to AI</> : <><UserCheck className="w-3.5 h-3.5"/>Claim</>}
                     </button>
                   </div>
 
-                  {/* Messages */}
                   <div className="flex-1 overflow-y-auto px-4 py-3 bg-gray-50 flex flex-col gap-2">
                     {loadingMsgs ? (
-                      <div className="flex justify-center items-center h-20"><Loader2 className="w-5 h-5 animate-spin text-gray-300" /></div>
+                      <div className="flex justify-center items-center h-20"><Loader2 className="w-5 h-5 animate-spin text-gray-300"/></div>
                     ) : messages.length === 0 ? (
                       <div className="flex justify-center items-center h-20 text-gray-400 text-xs">No messages yet</div>
                     ) : messages.map(msg => {
@@ -737,7 +657,7 @@ export default function WhatsApp() {
                       if (msg.contentType === 'note') return (
                         <div key={msg.id} className="flex justify-center">
                           <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800 flex items-center gap-2 max-w-xs">
-                            <StickyNote className="w-3 h-3 flex-shrink-0" />
+                            <StickyNote className="w-3 h-3 flex-shrink-0"/>
                             <span><strong>Note:</strong> {msg.content}</span>
                           </div>
                         </div>
@@ -747,84 +667,64 @@ export default function WhatsApp() {
                       return (
                         <div key={msg.id} className={`flex gap-2 ${isOut ? 'flex-row-reverse' : ''} max-w-[78%] ${isOut ? 'self-end' : 'self-start'}`}>
                           <div className="w-6 h-6 rounded-full flex items-center justify-center text-[9px] font-bold flex-shrink-0 mt-1"
-                            style={isOut
-                              ? { background: isAgent ? '#2563eb' : '#16a34a', color: '#fff' }
-                              : { background: clr(selectedChat.contactName).bg, color: clr(selectedChat.contactName).fg }}>
+                            style={isOut ? { background: isAgent ? '#2563eb' : '#16a34a', color: '#fff' } : { background: clr(selectedChat.contactName).bg, color: clr(selectedChat.contactName).fg }}>
                             {isOut ? (isAgent ? 'A' : 'AI') : ini(selectedChat.contactName)}
                           </div>
                           <div>
-                            {isOut && (
-                              <p className={`text-[10px] font-semibold mb-1 text-right ${isAgent ? 'text-blue-600' : 'text-green-600'}`}>
-                                {isAgent ? msg.sender.name : 'NovaGo AI'}
-                              </p>
-                            )}
-                            <div className={`px-3 py-2 rounded-xl text-sm leading-relaxed ${
-                              isOut
-                                ? isAgent ? 'bg-blue-600 text-white rounded-tr-sm' : 'bg-green-700 text-white rounded-tr-sm'
-                                : 'bg-white text-gray-900 rounded-tl-sm border border-gray-200'
-                            }`} style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
+                            {isOut && <p className={`text-[10px] font-semibold mb-1 text-right ${isAgent ? 'text-blue-600' : 'text-green-600'}`}>{isAgent ? msg.sender.name : 'NovaGo AI'}</p>}
+                            <div className={`px-3 py-2 rounded-xl text-sm leading-relaxed ${isOut ? (isAgent ? 'bg-blue-600 text-white rounded-tr-sm' : 'bg-green-700 text-white rounded-tr-sm') : 'bg-white text-gray-900 rounded-tl-sm border border-gray-200'}`}
+                              style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
                             <p className={`text-[10px] text-gray-400 mt-1 ${isOut ? 'text-right' : ''}`}>{fmt(msg.timestamp)}</p>
                           </div>
                         </div>
                       );
                     })}
-                    <div ref={msgEndRef} />
+                    <div ref={msgEndRef}/>
                   </div>
 
-                  {/* Quick replies */}
                   {quickOpen && (
                     <div className="border-t border-gray-200 bg-white px-3 py-2 flex flex-col gap-1 max-h-36 overflow-y-auto">
                       <div className="flex items-center justify-between mb-1">
                         <span className="text-xs font-semibold text-gray-500">Quick Replies</span>
-                        <button onClick={() => setQuickOpen(false)}><X className="w-3.5 h-3.5 text-gray-400" /></button>
+                        <button onClick={() => setQuickOpen(false)}><X className="w-3.5 h-3.5 text-gray-400"/></button>
                       </div>
                       {QUICK_REPLIES.map(qr => (
                         <button key={qr.label}
                           onClick={() => { setInputText(qr.text); setInputMode('reply'); setQuickOpen(false); taRef.current?.focus(); }}
                           className="flex items-center gap-2 px-2.5 py-2 text-xs text-left rounded-lg border border-gray-200 hover:border-green-300 hover:bg-green-50 hover:text-green-700 transition-colors">
                           <span>{qr.emoji}</span><span className="font-semibold">{qr.label}</span>
-                          <span className="text-gray-400 truncate">— {qr.text.slice(0, 40)}…</span>
+                          <span className="text-gray-400 truncate">— {qr.text.slice(0,40)}…</span>
                         </button>
                       ))}
                     </div>
                   )}
 
-                  {/* Input */}
                   <div className="border-t border-gray-200 bg-white flex-shrink-0">
                     <div className="flex border-b border-gray-100">
-                      {(['reply', 'note'] as const).map(m => (
+                      {(['reply','note'] as const).map(m => (
                         <button key={m} onClick={() => setInputMode(m)}
-                          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-semibold border-b-2 transition-colors ${
-                            inputMode === m
-                              ? m === 'reply' ? 'text-green-700 border-green-600' : 'text-amber-600 border-amber-500'
-                              : 'text-gray-400 border-transparent hover:text-gray-600'}`}>
-                          {m === 'reply' ? <><Send className="w-3.5 h-3.5" />Reply</> : <><StickyNote className="w-3.5 h-3.5" />Note</>}
+                          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-semibold border-b-2 transition-colors ${inputMode === m ? (m === 'reply' ? 'text-green-700 border-green-600' : 'text-amber-600 border-amber-500') : 'text-gray-400 border-transparent hover:text-gray-600'}`}>
+                          {m === 'reply' ? <><Send className="w-3.5 h-3.5"/>Reply</> : <><StickyNote className="w-3.5 h-3.5"/>Note</>}
                         </button>
                       ))}
                       <div className="ml-auto flex items-center gap-1.5 px-3 text-xs text-gray-400">
-                        <span className={`w-1.5 h-1.5 rounded-full ${isClaimed ? 'bg-blue-500' : 'bg-green-500 animate-pulse'}`} />
+                        <span className={`w-1.5 h-1.5 rounded-full ${isClaimed ? 'bg-blue-500' : 'bg-green-500 animate-pulse'}`}/>
                         {isClaimed ? 'Agent active' : 'AI active'}
                       </div>
                     </div>
                     {inputMode === 'note' && <p className="text-xs text-amber-600 px-3 pt-2">Internal note — not sent to customer</p>}
                     <div className="flex items-end gap-2 p-3">
-                      <button onClick={() => setQuickOpen(!quickOpen)} title="Quick replies"
-                        className="p-2 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors">
-                        <Zap className="w-4 h-4" />
-                      </button>
-                      <button className="p-2 rounded-lg hover:bg-gray-100 text-gray-400 transition-colors" title="Attach">
-                        <Paperclip className="w-4 h-4" />
-                      </button>
+                      <button onClick={() => setQuickOpen(!quickOpen)} title="Quick replies" className="p-2 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"><Zap className="w-4 h-4"/></button>
+                      <button className="p-2 rounded-lg hover:bg-gray-100 text-gray-400 transition-colors" title="Attach"><Paperclip className="w-4 h-4"/></button>
                       <textarea ref={taRef} rows={1} value={inputText}
                         onChange={e => setInputText(e.target.value)}
                         onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
                         onInput={e => { const t = e.target as HTMLTextAreaElement; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 120) + 'px'; }}
                         placeholder={inputMode === 'note' ? 'Write an internal note…' : isClaimed ? 'Type your reply…' : 'Claim to reply manually, or AI handles automatically…'}
-                        className={`flex-1 text-sm px-3 py-2 rounded-lg resize-none outline-none border transition-colors max-h-28 ${
-                          inputMode === 'note' ? 'bg-amber-50 border-amber-200 focus:border-amber-400' : 'bg-gray-50 border-gray-200 focus:border-green-500 focus:bg-white'}`} />
+                        className={`flex-1 text-sm px-3 py-2 rounded-lg resize-none outline-none border transition-colors max-h-28 ${inputMode === 'note' ? 'bg-amber-50 border-amber-200 focus:border-amber-400' : 'bg-gray-50 border-gray-200 focus:border-green-500 focus:bg-white'}`}/>
                       <button onClick={handleSend} disabled={!inputText.trim()}
                         className={`p-2 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${inputMode === 'note' ? 'bg-amber-100 text-amber-700 hover:bg-amber-200' : 'bg-green-600 text-white hover:bg-green-700'}`}>
-                        <Send className="w-4 h-4" />
+                        <Send className="w-4 h-4"/>
                       </button>
                     </div>
                   </div>
@@ -852,7 +752,7 @@ export default function WhatsApp() {
                     { icon: Info,  label: 'Status',   val: selectedChat.status, cls: '' },
                   ].map(r => (
                     <div key={r.label} className="flex items-center justify-between py-1.5 text-xs border-b border-gray-50 last:border-0">
-                      <span className="text-gray-400 flex items-center gap-1.5"><r.icon className="w-3 h-3" />{r.label}</span>
+                      <span className="text-gray-400 flex items-center gap-1.5"><r.icon className="w-3 h-3"/>{r.label}</span>
                       <span className={`font-medium truncate max-w-24 ${r.cls || 'text-gray-700'}`}>{r.val}</span>
                     </div>
                   ))}
@@ -865,10 +765,7 @@ export default function WhatsApp() {
                       <div key={o.id} className="bg-gray-50 rounded-lg p-2 mb-1.5 border border-gray-100">
                         <div className="flex items-center justify-between">
                           <span className="text-[11px] font-bold text-gray-700">{o.id}</span>
-                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
-                            o.status === 'delivered' ? 'bg-blue-100 text-blue-700'
-                              : o.status === 'preparing' ? 'bg-green-100 text-green-700'
-                              : 'bg-amber-100 text-amber-700'}`}>{o.status}</span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${o.status === 'delivered' ? 'bg-blue-100 text-blue-700' : o.status === 'preparing' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>{o.status}</span>
                         </div>
                         <p className="text-[11px] text-gray-400 mt-0.5">KSh {(o.total || 0).toFixed(0)}</p>
                       </div>
