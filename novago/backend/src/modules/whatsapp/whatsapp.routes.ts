@@ -1,30 +1,19 @@
 /**
  * whatsapp.routes.ts
  *
- * Single proxy between NovaGo admin portal and the wa.dt.wrld-main services.
- * All session + chat + message calls from the frontend go through here,
- * avoiding CORS and keeping credentials server-side.
+ * Proxy between the NovaGo admin portal and:
+ *   wwebjs-api (WA_API_URL, default :3000) — QR / session management
+ *   whatsapp-service (WA_SVC_URL, default :3001) — chats / messages / AI
  *
- * wwebjs-api     (WA_API_URL  default: http://localhost:3000) — QR / session mgmt
- * whatsapp-service (WA_SVC_URL default: http://localhost:3001) — chats / messages / AI
- *
- * Exact wwebjs-api endpoints used:
- *   GET  /session/start/:id
- *   GET  /session/status/:id      → returns { success, data: { state, ... } }
- *   GET  /session/qr/:id/image    → returns PNG image
- *   GET  /session/getSessions     → returns array of sessions
- *   GET  /session/terminate/:id
- *   GET  /session/restart/:id
- *
- * whatsapp-service endpoints:
- *   GET  /session/status/:id      → proxied from wwebjs-api, normalised
- *   GET  /session/qr/:id/image    → proxied from wwebjs-api
- *   GET  /chats
- *   GET  /chats/messages
- *   POST /chats/send
- *   POST /chats/claim
- *   POST /chats/release
- *   GET  /chats/context
+ * wwebjs-api URL patterns (kulemantu/wwebjs-api):
+ *   GET /session/getSessions
+ *   GET /session/:sessionId/start
+ *   GET /session/:sessionId/status
+ *   GET /session/:sessionId/qr          → JSON { success, qr: "data:image/png;base64,..." }
+ *   GET /session/:sessionId/qr/image    → PNG binary
+ *   GET /session/:sessionId/terminate
+ *   GET /session/:sessionId/restart
+ *   GET /ping
  */
 
 import { Router, Request, Response } from 'express';
@@ -32,26 +21,20 @@ import { prisma } from '../../utils/prisma';
 
 export const whatsappRouter = Router();
 
-const WA_API_URL = process.env.WA_API_URL  || 'http://localhost:3000';   // wwebjs-api
-const WA_SVC_URL = process.env.WA_SVC_URL  || 'http://localhost:3001';   // whatsapp-service
-const WA_API_KEY = process.env.WA_API_KEY  || '';
+const WA_API_URL = (process.env.WA_API_URL || 'http://localhost:3000').replace(/\/$/, '');
+const WA_SVC_URL = (process.env.WA_SVC_URL || 'http://localhost:3001').replace(/\/$/, '');
+const WA_API_KEY = process.env.WA_API_KEY || '';
 
-// ── Shared headers ────────────────────────────────────────────────────────────
-
-function waHeaders() {
+// ── Shared request headers ────────────────────────────────────────────────────
+function waHeaders(): Record<string, string> {
   return {
     'Content-Type': 'application/json',
     ...(WA_API_KEY ? { 'x-api-key': WA_API_KEY } : {}),
   };
 }
 
-// ── Generic JSON proxy helpers ────────────────────────────────────────────────
-
-async function proxyJson(
-  res: Response,
-  url: string,
-  opts: RequestInit = {}
-): Promise<void> {
+// ── Generic JSON proxy ────────────────────────────────────────────────────────
+async function proxyJson(res: Response, url: string, opts: RequestInit = {}): Promise<void> {
   try {
     const upstream = await fetch(url, {
       ...opts,
@@ -60,145 +43,119 @@ async function proxyJson(
     const body = await upstream.json().catch(() => ({}));
     res.status(upstream.status).json(body);
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Service unavailable: ${err.message}` });
+    res.status(503).json({
+      success: false,
+      error: `Service unavailable: ${err.message}`,
+      hint: 'Make sure wwebjs-api is running and WA_API_URL is set in the backend .env',
+    });
   }
 }
 
+// ── Binary image proxy ────────────────────────────────────────────────────────
 async function proxyImage(res: Response, url: string): Promise<void> {
   try {
     const upstream = await fetch(url, { headers: waHeaders() });
     if (!upstream.ok) {
-      res.status(upstream.status).json({ success: false, error: 'QR not available yet' });
-      return;
+      return res.status(upstream.status).json({ success: false, error: 'QR not available yet' }) as any;
     }
     const contentType = upstream.headers.get('content-type') || 'image/png';
     const buf = await upstream.arrayBuffer();
     res.setHeader('Content-Type', contentType);
     res.send(Buffer.from(buf));
   } catch (err: any) {
-    res.status(503).json({ success: false, error: `Service unavailable: ${err.message}` });
+    res.status(503).json({ success: false, error: `Image proxy error: ${err.message}` });
   }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SESSION MANAGEMENT  (calls wwebjs-api directly)
+// SESSION MANAGEMENT — wwebjs-api
+// Pattern: /session/:sessionId/action  (sessionId BEFORE action)
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
  * GET /api/whatsapp/sessions
- * List all wwebjs sessions → returns { success, data: SessionStatus[] }
+ * Lists all wwebjs sessions → GET /session/getSessions
  */
 whatsappRouter.get('/sessions', async (_req: Request, res: Response) => {
   try {
-    const upstream = await fetch(`${WA_API_URL}/session/getSessions`, {
-      headers: waHeaders(),
-    });
+    const upstream = await fetch(`${WA_API_URL}/session/getSessions`, { headers: waHeaders() });
     if (!upstream.ok) {
-      return res.status(upstream.status).json({ success: false, error: 'Could not fetch sessions' });
+      return res.status(upstream.status).json({ success: false, data: [], error: 'Could not fetch sessions' });
     }
-    const data = await upstream.json();
-    // wwebjs-api returns an array; wrap it for consistency
-    const sessions = Array.isArray(data) ? data : (data.data || data.sessions || []);
+    const raw = await upstream.json();
+    // wwebjs-api returns an array directly
+    const sessions = Array.isArray(raw) ? raw : (raw.data || raw.sessions || []);
     res.json({ success: true, data: sessions });
   } catch (err: any) {
-    res.status(503).json({ success: false, error: err.message });
+    // If wwebjs-api is down, return empty list (not an error — just not configured yet)
+    res.json({ success: true, data: [], hint: err.message });
   }
 });
 
 /**
  * GET /api/whatsapp/session/start/:sessionId
- * Start a new wwebjs session. Returns immediately; poll /status for QR / CONNECTED.
+ * → GET /session/:sessionId/start
  */
 whatsappRouter.get('/session/start/:sessionId', async (req: Request, res: Response) => {
-  await proxyJson(res, `${WA_API_URL}/session/start/${req.params.sessionId}`);
+  await proxyJson(res, `${WA_API_URL}/session/${req.params.sessionId}/start`);
 });
 
 /**
  * GET /api/whatsapp/session/status/:sessionId
- * Returns normalised status:
- *   { success: true, data: { sessionId, state, authenticated, phone?, pushName?, qrCode? } }
- *
- * Possible `state` values from wwebjs-api:
- *   SCAN_QR_CODE | CONNECTED | DISCONNECTED | INITIALIZING | FAILED
+ * → GET /session/:sessionId/status
+ * Normalises to { success, data: { sessionId, state, authenticated, phone?, pushName? } }
  */
 whatsappRouter.get('/session/status/:sessionId', async (req: Request, res: Response) => {
   const { sessionId } = req.params;
   try {
-    const upstream = await fetch(`${WA_API_URL}/session/status/${sessionId}`, {
-      headers: waHeaders(),
-    });
-
+    const upstream = await fetch(`${WA_API_URL}/session/${sessionId}/status`, { headers: waHeaders() });
     if (!upstream.ok) {
-      // Session not found — return disconnected
-      return res.json({
-        success: true,
-        data: { sessionId, state: 'DISCONNECTED', authenticated: false },
-      });
+      return res.json({ success: true, data: { sessionId, state: 'DISCONNECTED', authenticated: false } });
     }
-
     const raw = await upstream.json();
-    // wwebjs-api shape: { success, data: { state, ... } }  OR  { state, ... }
+    // wwebjs-api shape: { success, data: { sessionId, state, ... } }
     const inner = raw?.data ?? raw;
-    const state: string = inner?.state || inner?.status || 'DISCONNECTED';
-
-    // Also fetch QR code data if in QR state (as base64 string, not image)
-    let qrCode: string | undefined;
-    if (state === 'SCAN_QR_CODE') {
-      try {
-        const qrRes = await fetch(`${WA_API_URL}/session/qr/${sessionId}`, {
-          headers: waHeaders(),
-        });
-        if (qrRes.ok) {
-          const qrData = await qrRes.json();
-          qrCode = qrData?.data?.qr || qrData?.qr;
-        }
-      } catch { /* ignore */ }
-    }
-
     res.json({
       success: true,
       data: {
         sessionId,
-        state,
-        authenticated: state === 'CONNECTED',
+        state: inner?.state || inner?.status || 'DISCONNECTED',
+        authenticated: !!(inner?.state === 'CONNECTED' || inner?.authenticated),
         phone: inner?.phone || inner?.phoneNumber,
         pushName: inner?.pushName,
-        ...(qrCode ? { qrCode } : {}),
       },
     });
-  } catch (err: any) {
-    res.json({
-      success: true,
-      data: { sessionId, state: 'DISCONNECTED', authenticated: false },
-    });
+  } catch {
+    res.json({ success: true, data: { sessionId, state: 'DISCONNECTED', authenticated: false } });
   }
 });
 
 /**
  * GET /api/whatsapp/session/qr/:sessionId
- * Proxies the QR PNG image from wwebjs-api → browser.
- * wwebjs-api endpoint: GET /session/qr/:sessionId/image
+ * Proxies PNG image → GET /session/:sessionId/qr/image
  */
 whatsappRouter.get('/session/qr/:sessionId', async (req: Request, res: Response) => {
-  await proxyImage(res, `${WA_API_URL}/session/qr/${req.params.sessionId}/image`);
+  await proxyImage(res, `${WA_API_URL}/session/${req.params.sessionId}/qr/image`);
 });
 
 /**
  * GET /api/whatsapp/session/terminate/:sessionId
+ * → GET /session/:sessionId/terminate
  */
 whatsappRouter.get('/session/terminate/:sessionId', async (req: Request, res: Response) => {
-  await proxyJson(res, `${WA_API_URL}/session/terminate/${req.params.sessionId}`);
+  await proxyJson(res, `${WA_API_URL}/session/${req.params.sessionId}/terminate`);
 });
 
 /**
  * GET /api/whatsapp/session/restart/:sessionId
+ * → GET /session/:sessionId/restart
  */
 whatsappRouter.get('/session/restart/:sessionId', async (req: Request, res: Response) => {
-  await proxyJson(res, `${WA_API_URL}/session/restart/${req.params.sessionId}`);
+  await proxyJson(res, `${WA_API_URL}/session/${req.params.sessionId}/restart`);
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// CHATS  (calls whatsapp-service)
+// CHATS & MESSAGES — whatsapp-service
 // ══════════════════════════════════════════════════════════════════════════════
 
 whatsappRouter.get('/chats', async (req: Request, res: Response) => {
@@ -208,7 +165,6 @@ whatsappRouter.get('/chats', async (req: Request, res: Response) => {
 
 whatsappRouter.get('/messages', async (req: Request, res: Response) => {
   const qs = new URLSearchParams(req.query as Record<string, string>).toString();
-  // whatsapp-service stores messages under /chats/messages
   await proxyJson(res, `${WA_SVC_URL}/chats/messages${qs ? '?' + qs : ''}`);
 });
 
@@ -239,7 +195,7 @@ whatsappRouter.get('/chats/context', async (req: Request, res: Response) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// AI RESTAURANT DATA  (AI reads live menus from NovaGo DB)
+// AI RESTAURANT DATA — reads live menus from NovaGo DB
 // ══════════════════════════════════════════════════════════════════════════════
 
 whatsappRouter.get('/restaurant-data', async (req: Request, res: Response) => {
@@ -263,7 +219,7 @@ whatsappRouter.get('/restaurant-data', async (req: Request, res: Response) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// INCOMING WEBHOOK  (wwebjs-api → NovaGo → whatsapp-service AI)
+// INCOMING WEBHOOK — wwebjs-api → NovaGo → whatsapp-service AI
 // ══════════════════════════════════════════════════════════════════════════════
 
 whatsappRouter.post('/webhook', async (req: Request, res: Response) => {
@@ -275,7 +231,6 @@ whatsappRouter.post('/webhook', async (req: Request, res: Response) => {
     const msg = event.data || event;
     if (!msg.from || !msg.body || msg.fromMe) return;
     if ((msg.from as string).includes('@g.us')) return;
-
     await fetch(`${WA_SVC_URL}/webhook/incoming`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(WA_API_KEY ? { 'x-api-key': WA_API_KEY } : {}) },
@@ -287,7 +242,7 @@ whatsappRouter.post('/webhook', async (req: Request, res: Response) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// HEALTH
+// HEALTH CHECK
 // ══════════════════════════════════════════════════════════════════════════════
 
 whatsappRouter.get('/health', async (_req: Request, res: Response) => {
@@ -297,9 +252,9 @@ whatsappRouter.get('/health', async (_req: Request, res: Response) => {
   ]);
   res.json({
     success: true,
-    waApi:    waApiOk ? 'up' : 'down',
+    waApi: waApiOk ? 'up' : 'down',
     waService: waSvcOk ? 'up' : 'down',
-    waApiUrl:  WA_API_URL,
-    waSvcUrl:  WA_SVC_URL,
+    waApiUrl: WA_API_URL,
+    waSvcUrl: WA_SVC_URL,
   });
 });
